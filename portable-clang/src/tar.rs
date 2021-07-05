@@ -16,14 +16,17 @@ use {
 pub fn tar_from_directory(
     logger: &Logger,
     path: impl AsRef<Path>,
-    path_prefix: Option<impl AsRef<Path>>,
+    path_prefix: Option<&Path>,
 ) -> Result<Vec<u8>> {
     let root_dir = path.as_ref();
-    let path_prefix = path_prefix.map(|x| x.as_ref().to_path_buf());
+    let path_prefix = path_prefix.map(|x| x.to_path_buf());
 
     let mut builder = tar::Builder::new(vec![]);
 
-    for entry in walkdir::WalkDir::new(root_dir).sort_by(|a, b| a.file_name().cmp(b.file_name())) {
+    for entry in walkdir::WalkDir::new(root_dir)
+        .follow_links(false)
+        .sort_by(|a, b| a.file_name().cmp(b.file_name()))
+    {
         let entry = entry?;
 
         let archive_path = entry.path().strip_prefix(root_dir)?;
@@ -40,18 +43,34 @@ pub fn tar_from_directory(
             continue;
         }
 
-        // TODO record symlinks properly.
+        warn!(logger, "adding {} to tar archive", archive_path.display());
 
         let mut header = tar::Header::new_gnu();
+
         header.set_mode(if is_executable(&metadata) {
             0o755
         } else {
             0o644
         });
 
-        warn!(logger, "adding {} to tar archive", archive_path.display());
+        header.set_mtime(1609502400);
+        header.set_uid(0);
+        header.set_gid(0);
 
-        let data = std::fs::read(entry.path())?;
+        let data = if metadata.file_type().is_symlink() {
+            let link_name = std::fs::read_link(entry.path()).context("reading link")?;
+            header
+                .set_link_name(&link_name)
+                .context("setting link name")?;
+            header.set_entry_type(tar::EntryType::Symlink);
+
+            vec![]
+        } else {
+            header.set_entry_type(tar::EntryType::Regular);
+
+            std::fs::read(entry.path())?
+        };
+
         header.set_size(data.len() as _);
         builder.append_data(&mut header, archive_path, Cursor::new(data))?;
     }
@@ -64,6 +83,12 @@ pub fn tar_from_directory(
 #[derive(Clone, Debug, Default)]
 pub struct TarBuilder {
     pub(crate) files: FileManifest,
+}
+
+impl From<FileManifest> for TarBuilder {
+    fn from(files: FileManifest) -> Self {
+        Self { files }
+    }
 }
 
 impl TarBuilder {
@@ -102,8 +127,8 @@ impl TarBuilder {
             .context("adding support file to tar archive")
     }
 
-    /// Obtain a [Body] containing the tar archive content.
-    pub fn as_body(&self) -> Result<Body> {
+    /// Obtain an uncompressed tarball of content.
+    pub fn as_vec(&self) -> Result<Vec<u8>> {
         let mut builder = tar::Builder::new(vec![]);
 
         for (path, entry) in self.files.iter_entries() {
@@ -117,6 +142,11 @@ impl TarBuilder {
 
         builder.finish()?;
 
-        Ok(Body::from(builder.into_inner()?))
+        Ok(builder.into_inner()?)
+    }
+
+    /// Obtain a [Body] containing the tar archive content.
+    pub fn as_body(&self) -> Result<Body> {
+        Ok(Body::from(self.as_vec()?))
     }
 }

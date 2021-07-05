@@ -15,10 +15,13 @@ bollard = { version = "0.11", features = ["ssl"] }
 clap = "2.33"
 dirs = "4.0"
 futures-util = "0.3"
+git2 = { version = "0.13", default-features = false, features = ["vendored-libgit2"] }
+hex = "0.4"
 hyper = "0.14"
 indoc = "1.0"
 num_cpus = "1.13"
 once_cell = "1.8"
+sha2 = "0.9"
 slog = "2.7"
 tar = "0.4"
 tempfile = "3.2"

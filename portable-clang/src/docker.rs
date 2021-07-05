@@ -11,7 +11,7 @@ use {
         container::{
             Config as ContainerConfig, CreateContainerOptions, LogsOptions, StartContainerOptions,
         },
-        image::BuildImageOptions,
+        image::{BuildImageOptions, ImportImageOptions},
         models::HostConfig,
         Docker,
     },
@@ -21,16 +21,16 @@ use {
     slog::{warn, Logger},
     std::{
         collections::HashMap,
-        io::{Cursor, Write},
+        io::{Cursor, Read, Write},
         path::Path,
     },
-    tugger_file_manifest::FileEntry,
+    tugger_file_manifest::{FileEntry, FileManifest},
 };
 
 #[cfg(target_family = "unix")]
 use std::os::unix::fs::PermissionsExt;
 
-const ZSTD_COMPRESSION_LEVEL: i32 = 8;
+pub const ZSTD_COMPRESSION_LEVEL: i32 = 8;
 
 const DEBIAN_JESSIE_HEADER: &str = indoc! {r#"
     FROM debian@sha256:32ad5050caffb2c7e969dac873bce2c370015c2256ff984b70c1c08b3a2816a0
@@ -69,6 +69,37 @@ const DEBIAN_JESSIE_FOOTER: &str = indoc! {r#"
     USER build:build
 "#};
 
+const DEBIAN_BULLSEYE_HEADER: &str = indoc! {r#"
+    FROM debian@sha256:4d6ab716de467aad58e91b1b720f0badd7478847ec7a18f66027d0f8a329a43c
+    MAINTAINER Gregory Szorc <gregory.szorc@gmail.com>
+
+    RUN groupadd -g 1000 build && \
+        useradd -u 1000 -g 1000 -d /build -s /bin/bash -m build && \
+        chown -R build:build /build
+
+    ENV HOME=/build \
+        SHELL=/bin/bash \
+        USER=build \
+        LOGNAME=build \
+        HOSTNAME=builder \
+        DEBIAN_FRONTEND=noninteractive
+
+    CMD ["/bin/bash", "--login"]
+    WORKDIR '/build'
+
+    RUN for s in debian_bullseye debian_bullseye-updates; do \
+          echo "deb http://snapshot.debian.org/archive/${s%_*}/20211107T145307Z/ ${s#*_} main"; \
+        done > /etc/apt/sources.list && \
+        ( echo 'quiet "true";'; \
+          echo 'APT::Get::Assume-Yes "true";'; \
+          echo 'APT::Install-Recommends "false";'; \
+          echo 'Acquire::Check-Valid-Until "false";'; \
+          echo 'Acquire::Retries "5";'; \
+        ) > /etc/apt/apt.conf.d/99portable-clang
+
+    RUN apt-get update
+"#};
+
 const CLANG_DOCKERFILE: &str = indoc! {r#"
     RUN mkdir /toolchains && chown build:build /toolchains
     RUN apt-get install \
@@ -100,8 +131,41 @@ const GCC_DOCKERFILE: &str = indoc! {r#"
         unzip
 "#};
 
+const GLIBC_DOCKERFILE: &str = indoc! {r#"
+    RUN mkdir /toolchains && chown build:build /toolchains
+    RUN apt-get install \
+        autoconf \
+        automake \
+        bison \
+        build-essential \
+        ca-certificates \
+        flex \
+        gawk \
+        git \
+        procps \
+        python3 \
+        rsync \
+        texinfo \
+        watch
+
+    # We do this one as a one-off because it takes a while to run and caching the layer is
+    # useful for iterative development.
+    COPY scripts/docker-glibc-init.sh /usr/bin/
+    COPY files/build-many-glibcs* /build/
+    RUN /usr/bin/docker-glibc-init.sh
+
+    COPY files/* /build/
+    COPY scripts/* /usr/bin/
+
+    USER build:build
+"#};
+
 pub fn docker_client() -> Result<Docker> {
-    Ok(Docker::connect_with_socket_defaults()?)
+    Ok(Docker::connect_with_socket(
+        "unix:///var/run/docker.sock",
+        600,
+        bollard::API_DEFAULT_VERSION,
+    )?)
 }
 
 /// Build a Docker image with context.
@@ -130,6 +194,96 @@ pub async fn build_image(
     }
 
     Err(anyhow!("error building image"))
+}
+
+/// Load image tar data.
+pub async fn load_image_tar(logger: &Logger, docker: &Docker, tar_data: Vec<u8>) -> Result<String> {
+    let options = ImportImageOptions::default();
+    let mut stream = docker.import_image(options, Body::from(tar_data), None);
+
+    while let Some(info) = stream.try_next().await? {
+        if let Some(stream) = info.stream {
+            for part in stream.split('\n').filter(|s| !s.is_empty()) {
+                warn!(logger, "{}", part);
+
+                // For some reason we don't get the image ID reported in any aux responses.
+                // So parse it from stdout. This is extremely hacky.
+                if let Some((_, id)) = part.split_once("Loaded image ID: ") {
+                    return Ok(id.to_string());
+                }
+            }
+        } else if let Some(status) = info.status {
+            if let Some(progress) = info.progress {
+                warn!(logger, "{} {}", status, progress);
+            } else {
+                warn!(logger, "{}", status);
+            }
+        } else if let Some(image_id) = info.aux {
+            return image_id.id.ok_or_else(|| anyhow!("image ID not set"));
+        }
+    }
+
+    Err(anyhow!("error loading image"))
+}
+
+/// Load a tar.zst file into Docker and return the image id.
+pub async fn load_image_tar_zst(
+    logger: &Logger,
+    docker: &Docker,
+    reader: impl Read,
+) -> Result<String> {
+    let tar_data = zstd::decode_all(reader).context("zstd decompressing image data")?;
+
+    // In CI we see JSON decode errors intermittently. The root cause is unknown.
+    // https://github.com/fussybeaver/bollard/issues/171. We retry the operation
+    // multiple times as a workaround.
+    for attempt in 0..5 {
+        match load_image_tar(logger, docker, tar_data.clone()).await {
+            Ok(image) => {
+                return Ok(image);
+            }
+            Err(e) => {
+                warn!(logger, "attempt #{}: image load failed: {:?}", attempt, e);
+            }
+        }
+    }
+
+    Err(anyhow!("image load failed multiple times"))
+}
+
+async fn run_and_log_container(
+    logger: &Logger,
+    docker: &Docker,
+    options: CreateContainerOptions<String>,
+    config: ContainerConfig<String>,
+) -> Result<()> {
+    let response = docker
+        .create_container(Some(options), config)
+        .await
+        .context("creating Docker container")?;
+    let container_id = response.id;
+
+    let options = StartContainerOptions::<String>::default();
+    docker
+        .start_container(&container_id, Some(options))
+        .await
+        .context("starting Docker container")?;
+
+    let options = LogsOptions::<String> {
+        follow: true,
+        stdout: true,
+        stderr: true,
+        ..Default::default()
+    };
+    let mut stream = docker.logs(&container_id, Some(options));
+
+    while let Some(output) = stream.try_next().await? {
+        for line in output.to_string().split('\n').filter(|x| !x.is_empty()) {
+            warn!(logger, "{}", line);
+        }
+    }
+
+    Ok(())
 }
 
 fn derive_dockerfile_version_envs() -> String {
@@ -250,6 +404,81 @@ pub async fn build_image_gcc(
 
     let options = BuildImageOptions::<String> {
         t: "portable-clang:gcc".to_string(),
+        ..Default::default()
+    };
+
+    build_image(logger, docker, options, body).await
+}
+
+/// Build a Docker image for building glibc.
+pub async fn build_image_glibc(
+    logger: &Logger,
+    docker: &Docker,
+    cache_dir: impl AsRef<Path>,
+) -> Result<String> {
+    let cache_dir = cache_dir.as_ref();
+
+    let mut tar = TarBuilder::default();
+
+    for path in crate::downloads::fetch_linux_x86_64_support(logger, cache_dir)
+        .context("fetching support files")?
+        .into_iter()
+    {
+        tar.add_path_with_prefix(logger, path, "files")?;
+    }
+
+    tar.files.add_file_entry(
+        "files/build-many-glibcs.py",
+        FileEntry::new_from_data(include_bytes!("files/build-many-glibcs.py").to_vec(), true),
+    )?;
+    tar.files.add_file_entry(
+        "files/build-many-glibcs-sccache.patch",
+        FileEntry::new_from_data(
+            include_bytes!("files/build-many-glibcs-sccache.patch").to_vec(),
+            false,
+        ),
+    )?;
+    tar.files.add_file_entry(
+        "scripts/docker-glibc-build.sh",
+        FileEntry::new_from_data(
+            include_bytes!("scripts/docker-glibc-build.sh").to_vec(),
+            true,
+        ),
+    )?;
+    tar.files.add_file_entry(
+        "scripts/docker-glibc-init.sh",
+        FileEntry::new_from_data(
+            include_bytes!("scripts/docker-glibc-init.sh").to_vec(),
+            true,
+        ),
+    )?;
+    tar.files.add_file_entry(
+        "scripts/docker-extract-sccache.sh",
+        FileEntry::new_from_data(
+            include_bytes!("scripts/docker-extract-sccache.sh").to_vec(),
+            true,
+        ),
+    )?;
+    tar.files.add_file_entry(
+        "scripts/docker-glibc-collect-abi.py",
+        FileEntry::new_from_data(
+            include_bytes!("scripts/docker-glibc-collect-abi.py").to_vec(),
+            true,
+        ),
+    )?;
+
+    let dockerfile = format!(
+        "{}\n{}\n{}",
+        DEBIAN_BULLSEYE_HEADER,
+        GLIBC_DOCKERFILE,
+        derive_dockerfile_version_envs(),
+    );
+    tar.add_dockerfile_data(dockerfile.as_bytes())?;
+
+    let body = tar.as_body().context("building tar content")?;
+
+    let options = BuildImageOptions::<String> {
+        t: "portable-clang:glibc".to_string(),
         ..Default::default()
     };
 
@@ -381,28 +610,16 @@ pub async fn bootstrap_gcc(
 
     add_container_envs(&mut config)?;
 
-    let response = docker.create_container(Some(options), config).await?;
-    let container_id = response.id;
+    run_and_log_container(logger, docker, options, config)
+        .await
+        .context("running container")?;
 
-    let options = StartContainerOptions::<String>::default();
-    docker.start_container(&container_id, Some(options)).await?;
-
-    let options = LogsOptions::<String> {
-        follow: true,
-        stdout: true,
-        stderr: true,
-        ..Default::default()
-    };
-    let mut stream = docker.logs(&container_id, Some(options));
-
-    while let Some(output) = stream.try_next().await? {
-        for line in output.to_string().split('\n').filter(|x| !x.is_empty()) {
-            warn!(logger, "{}", line);
-        }
-    }
-
-    let binutils_tar = tar_from_directory(logger, out_dir.join("binutils"), Some("binutils"))?;
-    let gcc_tar = tar_from_directory(logger, out_dir.join("gcc"), Some("gcc"))?;
+    let binutils_tar = tar_from_directory(
+        logger,
+        out_dir.join("binutils"),
+        Some(Path::new("binutils")),
+    )?;
+    let gcc_tar = tar_from_directory(logger, out_dir.join("gcc"), Some(Path::new("gcc")))?;
 
     let binutils_tar_zst = zstd::encode_all(Cursor::new(binutils_tar), ZSTD_COMPRESSION_LEVEL)?;
     let gcc_tar_zst = zstd::encode_all(Cursor::new(gcc_tar), ZSTD_COMPRESSION_LEVEL)?;
@@ -466,35 +683,116 @@ pub async fn bootstrap_clang(
 
     add_container_envs(&mut config)?;
 
-    let response = docker
-        .create_container(Some(options), config)
+    run_and_log_container(logger, docker, options, config)
         .await
-        .context("creating Docker container")?;
-    let container_id = response.id;
+        .context("running container")?;
 
-    let options = StartContainerOptions::<String>::default();
-    docker
-        .start_container(&container_id, Some(options))
-        .await
-        .context("starting Docker container")?;
-
-    let options = LogsOptions::<String> {
-        follow: true,
-        stdout: true,
-        stderr: true,
-        ..Default::default()
-    };
-    let mut stream = docker.logs(&container_id, Some(options));
-
-    while let Some(output) = stream.try_next().await? {
-        for line in output.to_string().split('\n').filter(|x| !x.is_empty()) {
-            warn!(logger, "{}", line);
-        }
-    }
-
-    let clang_tar = tar_from_directory(logger, out_dir.join("clang"), Some("clang"))?;
+    let clang_tar = tar_from_directory(logger, out_dir.join("clang"), Some(Path::new("clang")))?;
     warn!(logger, "compressing clang tarball");
     let clang_tar_zst = zstd::encode_all(Cursor::new(clang_tar), ZSTD_COMPRESSION_LEVEL)?;
 
     Ok(clang_tar_zst)
+}
+
+pub async fn glibc_abis(logger: &Logger, docker: &Docker, image_id: &str) -> Result<FileManifest> {
+    let temp_dir = tempfile::Builder::new().prefix("pclang-").tempdir()?;
+    let out_dir = temp_dir.path();
+    let mut permissions = out_dir
+        .metadata()
+        .context("retrieving outputs directory metadata")?
+        .permissions();
+    permissions.set_mode(0o0777);
+    std::fs::set_permissions(&out_dir, permissions)
+        .context("setting temp directory permissions")?;
+
+    let options = CreateContainerOptions::<String>::default();
+
+    let config = ContainerConfig::<String> {
+        attach_stdin: Some(false),
+        attach_stdout: Some(true),
+        attach_stderr: Some(true),
+        tty: Some(true),
+        cmd: Some(vec![
+            "/usr/bin/docker-glibc-collect-abi.py".into(),
+            "/build/src/glibc".into(),
+            "/out".into(),
+        ]),
+        image: Some(image_id.into()),
+        host_config: Some(HostConfig {
+            auto_remove: Some(true),
+            binds: Some(vec![format!("{}:/out", out_dir.display())]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    run_and_log_container(logger, docker, options, config)
+        .await
+        .context("running container")?;
+
+    // The script deposited .json files for each ABI.
+    let mut m = FileManifest::default();
+
+    for entry in std::fs::read_dir(out_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if path.extension().map(|x| x.to_string_lossy()) != Some("json".into()) {
+            continue;
+        }
+
+        m.add_path_memory(&path, out_dir)
+            .context("adding JSON file to FileManifest")?;
+    }
+
+    Ok(m)
+}
+
+pub async fn glibc_build_single(
+    logger: &Logger,
+    docker: &Docker,
+    image_id: &str,
+    compiler: &str,
+    glibc: &str,
+) -> Result<Vec<u8>> {
+    let temp_dir = tempfile::Builder::new().prefix("pclang-").tempdir()?;
+    let out_dir = temp_dir.path();
+    let mut permissions = out_dir
+        .metadata()
+        .context("retrieving outputs directory metadata")?
+        .permissions();
+    permissions.set_mode(0o0777);
+    std::fs::set_permissions(&out_dir, permissions)
+        .context("setting temp directory permissions")?;
+
+    let options = CreateContainerOptions::<String>::default();
+
+    let mut config = ContainerConfig::<String> {
+        attach_stdin: Some(false),
+        attach_stdout: Some(true),
+        attach_stderr: Some(true),
+        tty: Some(true),
+        cmd: Some(vec![
+            "/usr/bin/docker-glibc-build.sh".into(),
+            compiler.into(),
+            glibc.into(),
+        ]),
+        image: Some(image_id.into()),
+        host_config: Some(HostConfig {
+            auto_remove: Some(true),
+            binds: Some(vec![format!("{}:/out", out_dir.display())]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    add_container_envs(&mut config)?;
+
+    run_and_log_container(logger, docker, options, config)
+        .await
+        .context("running container")?;
+
+    let glibc_path = out_dir.join(glibc);
+
+    tar_from_directory(logger, glibc_path, Some(Path::new(glibc)))
 }

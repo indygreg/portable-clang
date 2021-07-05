@@ -1,0 +1,33 @@
+diff --git a/build-many-glibcs.py b/build-many-glibcs.py
+index 41639f2..524c88b 100755
+--- a/build-many-glibcs.py
++++ b/build-many-glibcs.py
+@@ -1400,7 +1400,7 @@ class Config(object):
+                              '--build=%s' % self.ctx.build_triplet,
+                              '--host=%s' % self.triplet,
+                              '--prefix=',
+-                             'CC=%s-gcc -nostdlib' % self.triplet])
++                             'CC=sccache %s-gcc -nostdlib' % self.triplet])
+         cmdlist.add_command('install', ['make', 'DESTDIR=%s' % self.sysroot,
+                                         'install-data'])
+         cmdlist.cleanup_dir()
+@@ -1418,7 +1418,7 @@ class Config(object):
+                              '--host=%s' % self.triplet,
+                              '--prefix=',
+                              '--disable-profile', '--without-parted',
+-                             'CC=%s-gcc -nostdlib' % self.triplet])
++                             'CC=sccache %s-gcc -nostdlib' % self.triplet])
+         cmdlist.add_command('install', ['make', 'prefix=%s' % self.sysroot,
+                                         'no_deps=t', 'install-headers'])
+         cmdlist.cleanup_dir()
+@@ -1486,8 +1486,8 @@ class GlibcPolicyDefault(object):
+             '--enable-profile',
+             '--build=%s' % glibc.ctx.build_triplet,
+             '--host=%s' % glibc.triplet,
+-            'CC=%s' % glibc.tool_name('gcc'),
+-            'CXX=%s' % glibc.tool_name('g++'),
++            'CC=sccache %s' % glibc.tool_name('gcc'),
++            'CXX=sccache %s' % glibc.tool_name('g++'),
+             'AR=%s' % glibc.tool_name('ar'),
+             'AS=%s' % glibc.tool_name('as'),
+             'LD=%s' % glibc.tool_name('ld'),

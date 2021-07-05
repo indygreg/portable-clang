@@ -6,6 +6,7 @@ mod build;
 mod cli;
 mod docker;
 mod downloads;
+mod glibc;
 mod logging;
 mod tar;
 

@@ -1,0 +1,339 @@
+on:
+  push:
+jobs:
+  build-pclang:
+    runs-on: ubuntu-20.04
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      SCCACHE_BUCKET: 'portable-clang-sccache'
+      RUSTC_WRAPPER: sccache
+    steps:
+      - uses: actions/checkout@v2
+
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: 1.56.1
+          default: true
+          profile: minimal
+
+      - name: Install sccache
+        run: |
+          wget -O sccache.tar.gz --progress dot:mega https://github.com/mozilla/sccache/releases/download/v0.2.15/sccache-v0.2.15-x86_64-unknown-linux-musl.tar.gz
+          echo "2eb9d5e43845fffb49c727b0518c581b66c1c6bf  sccache.tar.gz" | shasum --check
+          tar -xvzf sccache.tar.gz
+          mv sccache-v0.2.15-x86_64-unknown-linux-musl/sccache /usr/share/rust/.cargo/bin/sccache
+          chmod +x /usr/share/rust/.cargo/bin/sccache
+
+      - name: Build pclang Binary
+        run: |
+          sccache --start-server
+          cargo build --release --bin pclang
+          sccache --stop-server
+
+      - name: Upload pclang Executable
+        uses: actions/upload-artifact@v2
+        with:
+          name: pclang-linux-x86_64
+          path: target/release/pclang
+
+  docker-image-glibc:
+    needs:
+      - build-pclang
+    runs-on: ubuntu-20.04
+    steps:
+      - name: Fetch pclang Executable
+        uses: actions/download-artifact@v2
+        with:
+          name: pclang-linux-x86_64
+
+      - name: Build glibc Docker Image
+        run: |
+          chmod +x pclang
+          ./pclang docker-image-glibc --dest image-glibc.tar.zst
+
+      - name: Upload Docker Image
+        uses: actions/upload-artifact@v2
+        with:
+          name: image-glibc
+          path: image-glibc.tar.zst
+          retention-days: 7
+
+  glibc-abis:
+    needs:
+      - build-pclang
+      - docker-image-glibc
+    runs-on: ubuntu-20.04
+    steps:
+      - name: Fetch pclang Executable
+        uses: actions/download-artifact@v2
+        with:
+          name: pclang-linux-x86_64
+
+      - name: Fetch glibc Docker Image
+        uses: actions/download-artifact@v2
+        with:
+          name: image-glibc
+
+      - name: Generate glibc ABI Data
+        run: |
+          chmod +x pclang
+          ./pclang glibc-abis --image=image-glibc.tar.zst glibc-abis.tar.zst
+
+      - name: Upload glibc ABIs Archive
+        uses: actions/upload-artifact@v2
+        with:
+          name: glibc-abis
+          path: glibc-abis.tar.zst
+          retention-days: 7
+
+  glibc-build:
+    needs:
+      - build-pclang
+      - docker-image-glibc
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - glibc: aarch64-linux-gnu
+            compiler: aarch64-linux-gnu
+          - glibc: aarch64-linux-gnu-disable-multi-arch
+            compiler: aarch64-linux-gnu
+          - glibc: aarch64_be-linux-gnu
+            compiler: aarch64_be-linux-gnu
+          - glibc: alpha-linux-gnu
+            compiler: alpha-linux-gnu
+          - glibc: arc-linux-gnu
+            compiler: arc-linux-gnu
+          - glibc: arc-linux-gnuhf
+            compiler: arc-linux-gnuhf
+          - glibc: arceb-linux-gnu
+            compiler: arceb-linux-gnu
+          - glibc: arm-linux-gnueabi
+            compiler: arm-linux-gnueabi
+          - glibc: arm-linux-gnueabi-v4t
+            compiler: arm-linux-gnueabi
+          - glibc: arm-linux-gnueabihf
+            compiler: arm-linux-gnueabihf
+          - glibc: arm-linux-gnueabihf-v7a
+            compiler: arm-linux-gnueabihf
+          - glibc: arm-linux-gnueabihf-v7a-disable-multi-arch
+            compiler: arm-linux-gnueabihf
+          - glibc: armeb-linux-gnueabi
+            compiler: armeb-linux-gnueabi
+          - glibc: armeb-linux-gnueabi-be8
+            compiler: armeb-linux-gnueabi-be8
+          - glibc: armeb-linux-gnueabihf
+            compiler: armeb-linux-gnueabihf
+          - glibc: armeb-linux-gnueabihf-be8
+            compiler: armeb-linux-gnueabihf-be8
+          - glibc: csky-linux-gnuabiv2
+            compiler: csky-linux-gnuabiv2
+          - glibc: csky-linux-gnuabiv2-soft
+            compiler: csky-linux-gnuabiv2-soft
+          - glibc: hppa-linux-gnu
+            compiler: hppa-linux-gnu
+          - glibc: i486-linux-gnu
+            compiler: x86_64-linux-gnu
+          - glibc: i586-linux-gnu
+            compiler: x86_64-linux-gnu
+          - glibc: i686-gnu
+            compiler: i686-gnu
+          - glibc: i686-linux-gnu
+            compiler: x86_64-linux-gnu
+          - glibc: i686-linux-gnu-disable-multi-arch
+            compiler: x86_64-linux-gnu
+          - glibc: i686-linux-gnu-static-pie
+            compiler: x86_64-linux-gnu
+          - glibc: ia64-linux-gnu
+            compiler: ia64-linux-gnu
+          - glibc: m68k-linux-gnu
+            compiler: m68k-linux-gnu
+          - glibc: m68k-linux-gnu-coldfire
+            compiler: m68k-linux-gnu-coldfire
+          - glibc: m68k-linux-gnu-coldfire-soft
+            compiler: m68k-linux-gnu-coldfire-soft
+          - glibc: microblaze-linux-gnu
+            compiler: microblaze-linux-gnu
+          - glibc: microblazeel-linux-gnu
+            compiler: microblazeel-linux-gnu
+          - glibc: mips-linux-gnu
+            compiler: mips64-linux-gnu
+          - glibc: mips-linux-gnu-nan2008
+            compiler: mips64-linux-gnu-nan2008
+          - glibc: mips-linux-gnu-nan2008-soft
+            compiler: mips64-linux-gnu-nan2008-soft
+          - glibc: mips-linux-gnu-soft
+            compiler: mips64-linux-gnu-soft
+          - glibc: mips64-linux-gnu-n32
+            compiler: mips64-linux-gnu
+          - glibc: mips64-linux-gnu-n32-nan2008
+            compiler: mips64-linux-gnu-nan2008
+          - glibc: mips64-linux-gnu-n32-nan2008-soft
+            compiler: mips64-linux-gnu-nan2008-soft
+          - glibc: mips64-linux-gnu-n32-soft
+            compiler: mips64-linux-gnu-soft
+          - glibc: mips64-linux-gnu-n64
+            compiler: mips64-linux-gnu
+          - glibc: mips64-linux-gnu-n64-nan2008
+            compiler: mips64-linux-gnu-nan2008
+          - glibc: mips64-linux-gnu-n64-nan2008-soft
+            compiler: mips64-linux-gnu-nan2008-soft
+          - glibc: mips64-linux-gnu-n64-soft
+            compiler: mips64-linux-gnu-soft
+          - glibc: mips64el-linux-gnu-n32
+            compiler: mips64el-linux-gnu
+          - glibc: mips64el-linux-gnu-n32-nan2008
+            compiler: mips64el-linux-gnu-nan2008
+          - glibc: mips64el-linux-gnu-n32-nan2008-soft
+            compiler: mips64el-linux-gnu-nan2008-soft
+          - glibc: mips64el-linux-gnu-n32-soft
+            compiler: mips64el-linux-gnu-soft
+          - glibc: mips64el-linux-gnu-n64
+            compiler: mips64el-linux-gnu
+          - glibc: mips64el-linux-gnu-n64-nan2008
+            compiler: mips64el-linux-gnu-nan2008
+          - glibc: mips64el-linux-gnu-n64-nan2008-soft
+            compiler: mips64el-linux-gnu-nan2008-soft
+          - glibc: mips64el-linux-gnu-n64-soft
+            compiler: mips64el-linux-gnu-soft
+          - glibc: mipsel-linux-gnu
+            compiler: mips64el-linux-gnu
+          - glibc: mipsel-linux-gnu-nan2008
+            compiler: mips64el-linux-gnu-nan2008
+          - glibc: mipsel-linux-gnu-nan2008-soft
+            compiler: mips64el-linux-gnu-nan2008-soft
+          - glibc: mipsel-linux-gnu-soft
+            compiler: mips64el-linux-gnu-soft
+          - glibc: mipsisa32r6el-linux-gnu
+            compiler: mipsisa64r6el-linux-gnu
+          - glibc: mipsisa64r6el-linux-gnu-n32
+            compiler: mipsisa64r6el-linux-gnu
+          - glibc: mipsisa64r6el-linux-gnu-n64
+            compiler: mipsisa64r6el-linux-gnu
+          - glibc: nios2-linux-gnu
+            compiler: nios2-linux-gnu
+          - glibc: powerpc-linux-gnu
+            compiler: powerpc-linux-gnu
+          - glibc: powerpc-linux-gnu-power4
+            compiler: powerpc-linux-gnu
+          - glibc: powerpc-linux-gnu-soft
+            compiler: powerpc-linux-gnu-soft
+          - glibc: powerpc64-linux-gnu
+            compiler: powerpc64-linux-gnu
+          - glibc: powerpc64le-linux-gnu
+            compiler: powerpc64le-linux-gnu
+          - glibc: riscv32-linux-gnu-rv32imac-ilp32
+            compiler: riscv32-linux-gnu-rv32imac-ilp32
+          - glibc: riscv32-linux-gnu-rv32imafdc-ilp32
+            compiler: riscv32-linux-gnu-rv32imafdc-ilp32
+          - glibc: riscv32-linux-gnu-rv32imafdc-ilp32d
+            compiler: riscv32-linux-gnu-rv32imafdc-ilp32d
+          - glibc: riscv64-linux-gnu-rv64imac-lp64
+            compiler: riscv64-linux-gnu-rv64imac-lp64
+          - glibc: riscv64-linux-gnu-rv64imafdc-lp64
+            compiler: riscv64-linux-gnu-rv64imafdc-lp64
+          - glibc: riscv64-linux-gnu-rv64imafdc-lp64d
+            compiler: riscv64-linux-gnu-rv64imafdc-lp64d
+          - glibc: s390-linux-gnu
+            compiler: s390x-linux-gnu
+          - glibc: s390x-linux-gnu
+            compiler: s390x-linux-gnu
+          - glibc: s390x-linux-gnu-O3
+            compiler: s390x-linux-gnu
+          - glibc: sh3-linux-gnu
+            compiler: sh3-linux-gnu
+          - glibc: sh3eb-linux-gnu
+            compiler: sh3eb-linux-gnu
+          - glibc: sh4-linux-gnu
+            compiler: sh4-linux-gnu
+          - glibc: sh4-linux-gnu-soft
+            compiler: sh4-linux-gnu-soft
+          - glibc: sh4eb-linux-gnu
+            compiler: sh4eb-linux-gnu
+          - glibc: sh4eb-linux-gnu-soft
+            compiler: sh4eb-linux-gnu-soft
+          - glibc: sparc64-linux-gnu
+            compiler: sparc64-linux-gnu
+          - glibc: sparc64-linux-gnu-disable-multi-arch
+            compiler: sparc64-linux-gnu
+          - glibc: sparcv8-linux-gnu-leon3
+            compiler: sparc64-linux-gnu
+          - glibc: sparcv9-linux-gnu
+            compiler: sparc64-linux-gnu
+          - glibc: sparcv9-linux-gnu-disable-multi-arch
+            compiler: sparc64-linux-gnu
+          - glibc: x86_64-linux-gnu
+            compiler: x86_64-linux-gnu
+          - glibc: x86_64-linux-gnu-disable-multi-arch
+            compiler: x86_64-linux-gnu
+          - glibc: x86_64-linux-gnu-static-pie
+            compiler: x86_64-linux-gnu
+          - glibc: x86_64-linux-gnu-x32
+            compiler: x86_64-linux-gnu
+          - glibc: x86_64-linux-gnu-x32-static-pie
+            compiler: x86_64-linux-gnu
+    runs-on: ubuntu-20.04
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      SCCACHE_BUCKET: 'portable-clang-sccache'
+    steps:
+      - name: Fetch pclang Executable
+        uses: actions/download-artifact@v2
+        with:
+          name: pclang-linux-x86_64
+
+      - name: Fetch glibc Docker Image
+        uses: actions/download-artifact@v2
+        with:
+          name: image-glibc
+
+      - name: Build glibc
+        run: |
+          chmod +x pclang
+          ./pclang build-glibc --image=image-glibc.tar.zst --compiler=${{ matrix.config.compiler }} --glibc=${{ matrix.config.glibc }} .
+
+      - name: Upload glibc
+        uses: actions/upload-artifact@v2
+        with:
+          name: glibc-individual
+          path: glibc-${{ matrix.config.glibc }}.tar.zst
+          retention-days: 7
+
+  glibc-unify:
+    needs:
+      - build-pclang
+      - glibc-build
+    runs-on: ubuntu-20.04
+    steps:
+      - name: Fetch pclang Executable
+        uses: actions/download-artifact@v2
+        with:
+          name: pclang-linux-x86_64
+
+      - name: Fetch glibc Builds
+        uses: actions/download-artifact@v2
+        with:
+          name: glibc-individual
+          path: glibcs
+
+      - name: Unify glibc builds
+        run: |
+          chmod +x pclang
+          ./pclang glibc-unify --dest-tar-zst glibc-all.tar.zst glibcs/*.tar.zst
+          ./pclang glibc-unify --headers-only --dest-tar-zst glibc-headers.tar.zst glibcs/*.tar.zst
+
+      - name: Upload Unified glibc
+        uses: actions/upload-artifact@v2
+        with:
+          name: glibc-all
+          path: glibc-all.tar.zst
+          retention-days: 7
+
+      - name: Upload glibc Headers
+        uses: actions/upload-artifact@v2
+        with:
+          name: glibc-headers
+          path: glibc-headers.tar.zst
+          retention-days: 7
