@@ -1,0 +1,162 @@
+on:
+  push:
+jobs:
+  build-pclang:
+    runs-on: ubuntu-20.04
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      SCCACHE_BUCKET: 'portable-clang-sccache'
+      RUSTC_WRAPPER: sccache
+    steps:
+      - uses: actions/checkout@v2
+
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: 1.56.1
+          default: true
+          profile: minimal
+
+      - name: Install sccache
+        run: |
+          wget -O sccache.tar.gz --progress dot:mega https://github.com/mozilla/sccache/releases/download/v0.2.15/sccache-v0.2.15-x86_64-unknown-linux-musl.tar.gz
+          echo "2eb9d5e43845fffb49c727b0518c581b66c1c6bf  sccache.tar.gz" | shasum --check
+          tar -xvzf sccache.tar.gz
+          mv sccache-v0.2.15-x86_64-unknown-linux-musl/sccache /usr/share/rust/.cargo/bin/sccache
+          chmod +x /usr/share/rust/.cargo/bin/sccache
+
+      - name: Build pclang Binary
+        run: |
+          sccache --start-server
+          cargo build --release --bin pclang
+          sccache --stop-server
+
+      - name: Upload pclang Executable
+        uses: actions/upload-artifact@v2
+        with:
+          name: pclang-linux-x86_64
+          path: target/release/pclang
+
+  docker-image-clang:
+    needs:
+      - build-pclang
+    runs-on: ubuntu-20.04
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Fetch pclang Executable
+        uses: actions/download-artifact@v2
+        with:
+          name: pclang-linux-x86_64
+
+      - name: Build Clang Docker Image
+        run: |
+          chmod +x pclang
+          ./pclang docker-image-clang --dest image-clang.tar.zst
+
+      - name: Upload Docker Image
+        uses: actions/upload-artifact@v2
+        with:
+          name: image-clang
+          path: image-clang.tar.zst
+          retention-days: 7
+
+  docker-image-gcc:
+    needs:
+      - build-pclang
+    runs-on: ubuntu-20.04
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Fetch pclang Executable
+        uses: actions/download-artifact@v2
+        with:
+          name: pclang-linux-x86_64
+
+      - name: Build GCC Docker Image
+        run: |
+          chmod +x pclang
+          ./pclang docker-image-gcc --dest image-gcc.tar.zst
+
+      - name: Upload Docker Image
+        uses: actions/upload-artifact@v2
+        with:
+          name: image-gcc
+          path: image-gcc.tar.zst
+          retention-days: 7
+
+  build-gcc:
+    needs:
+      - build-pclang
+    runs-on: ubuntu-20.04
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      SCCACHE_BUCKET: 'portable-clang-sccache'
+
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Fetch pclang Executable
+        uses: actions/download-artifact@v2
+        with:
+          name: pclang-linux-x86_64
+
+      - name: Build gcc
+        run: |
+          chmod +x pclang
+          ./pclang build-gcc .
+
+      - name: Upload binutils
+        uses: actions/upload-artifact@v2
+        with:
+          name: binutils
+          path: binutils.tar.zst
+          retention-days: 7
+
+      - name: Upload gcc
+        uses: actions/upload-artifact@v2
+        with:
+          name: gcc
+          path: gcc.tar.zst
+          retention-days: 7
+
+  build-clang:
+    needs:
+      - build-pclang
+      - build-gcc
+    runs-on: ubuntu-20.04
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      SCCACHE_BUCKET: 'portable-clang-sccache'
+
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Fetch pclang Executable
+        uses: actions/download-artifact@v2
+        with:
+          name: pclang-linux-x86_64
+
+      - name: Fetch binutils
+        uses: actions/download-artifact@v2
+        with:
+          name: binutils
+
+      - name: Fetch GCC Toolchain
+        uses: actions/download-artifact@v2
+        with:
+          name: gcc
+
+      - name: Build Clang
+        run: |
+          chmod +x pclang
+          ./pclang build-clang --bootstrap-dir . .
+
+      - name: Upload Clang
+        uses: actions/upload-artifact@v2
+        with:
+          name: clang
+          path: clang.tar.zst
+          retention-days: 7

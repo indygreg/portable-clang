@@ -3,9 +3,9 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use {
+    crate::build::Environment,
     anyhow::{anyhow, Context, Result},
     clap::{App, AppSettings, Arg, ArgMatches, SubCommand},
-    slog::Logger,
     std::path::PathBuf,
 };
 
@@ -49,6 +49,54 @@ pub fn run_pclang() -> Result<i32> {
         .setting(AppSettings::ArgRequiredElseHelp)
         .version(PCLANG_VERSION)
         .author("Gregory Szorc <gregory.szorc@gmail.com>");
+
+    let app = app.subcommand(
+        SubCommand::with_name("build-clang")
+            .about("Build Clang core artifact")
+            .arg(
+                Arg::with_name("bootstrap_dir")
+                    .long("--bootstrap-dir")
+                    .takes_value(true)
+                    .help("Directory containing gcc toolchain artifact used to bootstrap clang"),
+            )
+            .arg(
+                Arg::with_name("dest")
+                    .required(true)
+                    .help("Destination directory to write artifacts to"),
+            ),
+    );
+
+    let app = app.subcommand(
+        SubCommand::with_name("build-gcc")
+            .about("Build GCC artifacts needed to bootstrap Clang")
+            .arg(
+                Arg::with_name("dest")
+                    .required(true)
+                    .help("Destination directory to write artifacts to"),
+            ),
+    );
+
+    let app = app.subcommand(
+        SubCommand::with_name("docker-image-clang")
+            .about("Build Docker image for building Clang")
+            .arg(
+                Arg::with_name("dest")
+                    .long("--dest")
+                    .takes_value(true)
+                    .help("Destination file to write zstd compressed image to"),
+            ),
+    );
+
+    let app = app.subcommand(
+        SubCommand::with_name("docker-image-gcc")
+            .about("Build Docker image for building GCC")
+            .arg(
+                Arg::with_name("dest")
+                    .long("--dest")
+                    .takes_value(true)
+                    .help("Destination file to write zstd compressed image to"),
+            ),
+    );
 
     let app = app.subcommand(
         SubCommand::with_name("fetch-gcc-sources")
@@ -98,36 +146,73 @@ pub fn run_pclang() -> Result<i32> {
 
     let matches = app.get_matches();
 
-    match matches.subcommand() {
-        ("fetch-gcc-sources", Some(args)) => command_fetch_gcc_sources(&logger, args),
-        ("fetch-llvm-sources", Some(args)) => command_fetch_llvm_sources(&logger, args),
-        ("fetch-secure", Some(args)) => command_fetch_secure(&logger, args),
-        ("fetch-support", Some(args)) => command_fetch_support(&logger, args),
-        _ => Err(anyhow!("invalid sub-command")),
-    }
+    let env = Environment::new(logger)?;
+
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            match matches.subcommand() {
+                ("build-clang", Some(args)) => command_build_clang(env, args).await,
+                ("build-gcc", Some(args)) => command_build_gcc(env, args).await,
+                ("docker-image-clang", Some(args)) => command_docker_image_clang(env, args).await,
+                ("docker-image-gcc", Some(args)) => command_docker_image_gcc(env, args).await,
+                ("fetch-gcc-sources", Some(args)) => command_fetch_gcc_sources(env, args).await,
+                ("fetch-llvm-sources", Some(args)) => command_fetch_llvm_sources(env, args).await,
+                ("fetch-secure", Some(args)) => command_fetch_secure(env, args).await,
+                ("fetch-support", Some(args)) => command_fetch_support(env, args).await,
+                _ => Err(anyhow!("invalid sub-command")),
+            }
+        })
 }
 
-fn command_fetch_gcc_sources(logger: &Logger, args: &ArgMatches) -> Result<i32> {
-    let dest = args.value_of("dest").expect("dest argument is required");
+async fn command_build_clang<'a>(env: Environment, args: &ArgMatches<'a>) -> Result<i32> {
+    let dest_dir = PathBuf::from(args.value_of_os("dest").expect("dest argument is required"));
+    let bootstrap_dir = args.value_of_os("bootstrap_dir").map(PathBuf::from);
 
-    let dest = PathBuf::from(dest);
-
-    crate::downloads::fetch_gcc_sources(logger, &dest).context("fetching GCC sources")?;
+    env.build_clang(&dest_dir, bootstrap_dir).await?;
 
     Ok(0)
 }
 
-fn command_fetch_llvm_sources(logger: &Logger, args: &ArgMatches) -> Result<i32> {
-    let dest = args.value_of("dest").expect("dest argument is required");
+async fn command_build_gcc<'a>(env: Environment, args: &ArgMatches<'a>) -> Result<i32> {
+    let dest_dir = PathBuf::from(args.value_of_os("dest").expect("dest argument is required"));
 
-    let dest = PathBuf::from(dest);
-
-    crate::downloads::fetch_llvm_sources(logger, &dest).context("fetching LLVM sources")?;
+    env.build_gcc(&dest_dir).await?;
 
     Ok(0)
 }
 
-fn command_fetch_secure(logger: &Logger, args: &ArgMatches) -> Result<i32> {
+async fn command_docker_image_clang<'a>(env: Environment, args: &ArgMatches<'a>) -> Result<i32> {
+    env.docker_image_clang(args.value_of_os("dest")).await?;
+
+    Ok(0)
+}
+
+async fn command_docker_image_gcc<'a>(env: Environment, args: &ArgMatches<'a>) -> Result<i32> {
+    env.docker_image_gcc(args.value_of_os("dest")).await?;
+
+    Ok(0)
+}
+
+async fn command_fetch_gcc_sources<'a>(env: Environment, args: &ArgMatches<'a>) -> Result<i32> {
+    let dest = PathBuf::from(args.value_of_os("dest").expect("dest argument is required"));
+
+    crate::downloads::fetch_gcc_sources(env.logger(), &dest).context("fetching GCC sources")?;
+
+    Ok(0)
+}
+
+async fn command_fetch_llvm_sources<'a>(env: Environment, args: &ArgMatches<'a>) -> Result<i32> {
+    let dest = PathBuf::from(args.value_of_os("dest").expect("dest argument is required"));
+
+    crate::downloads::fetch_llvm_sources(env.logger(), &dest).context("fetching LLVM sources")?;
+
+    Ok(0)
+}
+
+async fn command_fetch_secure<'a>(env: Environment, args: &ArgMatches<'a>) -> Result<i32> {
     let url = args.value_of("url").expect("url argument is required");
     let sha256 = args
         .value_of("sha256")
@@ -151,18 +236,16 @@ fn command_fetch_secure(logger: &Logger, args: &ArgMatches) -> Result<i32> {
         sha256: sha256.to_string(),
     };
 
-    tugger_common::http::download_to_path(logger, &content, &dest)
+    tugger_common::http::download_to_path(env.logger(), &content, &dest)
         .context("downloading remote content")?;
 
     Ok(0)
 }
 
-fn command_fetch_support(logger: &Logger, args: &ArgMatches) -> Result<i32> {
-    let dest = args.value_of("dest").expect("dest argument is required");
+async fn command_fetch_support<'a>(env: Environment, args: &ArgMatches<'a>) -> Result<i32> {
+    let dest = PathBuf::from(args.value_of_os("dest").expect("dest argument is required"));
 
-    let dest = PathBuf::from(dest);
-
-    crate::downloads::fetch_linux_x86_64_support(logger, &dest)
+    crate::downloads::fetch_linux_x86_64_support(env.logger(), &dest)
         .context("fetching support artifacts")?;
 
     Ok(0)
