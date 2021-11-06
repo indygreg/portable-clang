@@ -1,0 +1,5 @@
+[workspace]
+members = [
+  "llvm-option-parser",
+  "portable-clang",
+]
